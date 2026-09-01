@@ -12,14 +12,23 @@ driver or gamma ramp is touched, and no registry key is written.
 
 ## Install
 
-Put this folder on your `PATH` so `overlay` works from any prompt:
+Nothing to install — `overlay.cmd` runs from wherever you cloned it. To call it
+by name from any prompt, append the folder to your **user** `PATH`, in
+PowerShell:
 
-```bash
-setx PATH "%PATH%;C:\programming\claude\overlay"
+```powershell
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';C:\programming\claude\overlay', 'User')
 ```
 
-Open a new terminal afterwards. `overlay.cmd` works from cmd.exe, PowerShell,
-Windows Terminal and the Run box; `overlay.ps1` can be called directly too.
+Open a new terminal afterwards.
+
+> Don't use `setx PATH "%PATH%;..."` for this. `%PATH%` is the *combined*
+> machine + user path, `setx` writes it to the user path, and the result both
+> duplicates every machine entry into your user path and silently truncates at
+> 1024 characters. The line above only ever touches the user portion.
+
+`overlay.cmd` works from cmd.exe, PowerShell, Windows Terminal and the Win+R
+Run box; `overlay.ps1` can be called directly too.
 
 ## Usage
 
