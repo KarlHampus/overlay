@@ -67,8 +67,26 @@ otherwise leave the desktop stuck tinted with nothing running to undo it.
 If `MagInitialize`/`Apply` fails, the worker logs and falls through to the
 overlay engine rather than doing nothing.
 
+The applied transform is `out = in * gain + translation`, diagonal and
+translation row (indices 20-22) respectively. Three ways to move it:
+
+| Knob | Pivot | Black | Matrix |
+| --- | --- | --- | --- |
+| `-Dim` negative (`light`) | black | stays black | gain > 1, translation 0 |
+| `-Contrast` positive | mid-grey | stays black | gain `c`, translation `0.5(1-c)` |
+| `-Lift` positive | - | raised | translation > 0 |
+
+`light` is deliberately a **pure gain, no lift**. An earlier cut added lift so
+dark UI would lighten too; it works but goes hazy and loses contrast, and the
+user asked for contrast instead. Do not reintroduce lift into that preset.
+
+Verified by reading the live matrix back with `MagGetFullscreenColorEffect`:
+`light medium` -> gain 1.22 / translation 0; `-Contrast 30` -> 1.3 / -0.15;
+`-Dim -20 -Contrast 25` -> 1.5 / -0.15.
+
 **overlay** — the original layered window. Kept because it is the fallback, and
-because `-Tint` only means anything there.
+because `-Tint` only means anything there. It cannot brighten at all, so the
+front end rejects a negative dim or any lift on that engine.
 
 ### The blend (overlay engine only)
 
@@ -90,8 +108,19 @@ number or a named level from `$StrengthWords`; `Resolve-Strength` normalises it
 to an int, and `$strengthNum` is the only value used after that point. Do not
 reintroduce `[int]$Strength` — the named levels depend on the string type.
 
+Measuring the effect by screen capture is unreliable on a live desktop: content
+repainting between the on and off captures will masquerade as an effect. Bracket
+every reading with an OFF reading and discard the result unless the two OFF
+readings agree, or just read the matrix back instead.
+
 `Test-StrengthToken` is what lets a bare `overlay 30` / `overlay medium` fall
-through to the `night` preset.
+through to the `night` preset. **Presets are checked first**, so a name that is
+both never resolves to the level - `light` used to be a strength word (25) and
+silently swallowed `overlay light`, which is why it is no longer one.
+
+`$Dim`, `$Warm` and `$Lift` use `[int]::MinValue` as their "not supplied"
+sentinel, not `-1`, because a negative `-Dim` is a real value meaning brighten.
+Do not go back to `-lt 0` checks on them.
 
 ## Gotchas
 

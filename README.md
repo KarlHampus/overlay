@@ -39,7 +39,8 @@ Run box; `overlay.ps1` can be called directly too.
 | `overlay dark [strength]` | dimming only, no colour shift (`dim` is a synonym) |
 | `overlay sunset [strength]` | stronger dim + full warmth |
 | `overlay sleep [strength]` | heaviest dim + full warmth |
-| `overlay custom -Dim N -Warm N` | exact control: dim 0-85, warm 0-100 |
+| `overlay light [strength]` | the other direction — brightens, black stays black (`bright` is a synonym) |
+| `overlay custom -Dim N -Warm N -Contrast N -Lift N` | exact control: dim -60..85, warm 0-100, contrast -80..100, lift -40..40 |
 | `overlay more` / `overlay less` | nudge the current strength by 10 |
 | `overlay off` | remove the overlay |
 | `overlay` / `overlay status` | show what is currently applied |
@@ -53,7 +54,7 @@ anywhere a number does:
 | Level | Value |
 | --- | --- |
 | `faint`, `subtle` | 15 |
-| `low`, `light` | 25 |
+| `low` | 25 |
 | `medium`, `med`, `mid` | 50 |
 | `strong`, `high` | 75 |
 | `max`, `full` | 100 |
@@ -117,6 +118,49 @@ untinted screen. `dim` is a straight multiply on all three channels, so it is
 real dimming rather than a grey veil over the top.
 
 Strength maps linearly onto temperature: `0` = 6500K, `100` = 2700K.
+
+### Going the other way: `light`
+
+The full transform is:
+
+```
+out = in * gain + translation
+```
+
+`light` is a **pure gain** — `gain = 1 - dim`, so a negative dim brightens, with
+translation left at zero. That pivots about black: `0 x anything` is still `0`,
+so black stays black and only lit pixels come up. Verified on a static black
+region, `light medium` (gain 1.22) reads 0 with the effect on and 0 with it off.
+
+An earlier version added a *lift* (positive translation) to raise blacks off
+zero so dark UI got lighter too. It works, but it trades away contrast and makes
+the screen look hazy, so it is no longer what `light` does. `-Lift` is still
+there if you want it.
+
+### Contrast
+
+`-Contrast N` pivots about mid-grey rather than about black:
+
+```
+out = (in - 0.5) * c + 0.5        c = 1 + N/100
+```
+
+which is a gain of `c` plus a *negative* translation of `0.5(1 - c)`. Blacks
+clamp at black, whites push toward white, midtones spread apart. `-Contrast 30`
+produces gain `1.3`, translation `-0.15`; a black pixel computes to `-0.15` and
+clamps to 0, mid-grey stays exactly mid-grey.
+
+It composes with everything else — `overlay custom -Dim -20 -Contrast 25` gives
+gain `1.5` with translation `-0.15`: brighter *and* punchier.
+
+| Knob | Pivot | Black | Effect |
+| --- | --- | --- | --- |
+| `-Dim` negative (`light`) | black | stays black | brightens everything lit |
+| `-Contrast` positive | mid-grey | stays black | darks hold, brights push up |
+| `-Lift` positive | — | **raised** | lighter but hazy, contrast lost |
+
+Brightening and contrast require the matrix engine; a layered window can only
+ever darken, so `-Engine overlay` rejects them.
 
 ### The overlay engine (`-Engine overlay`)
 

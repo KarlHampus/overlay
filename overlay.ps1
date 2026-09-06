@@ -3,20 +3,27 @@
     Screen tint / dimmer overlay for Windows - a Night Shift style filter driven from the command line.
 
 .DESCRIPTION
-    Paints a click-through, always-on-top layered window over every monitor. The window is a
-    solid colour at partial opacity, so it darkens and/or warms everything underneath without
-    touching display drivers, gamma ramps or the registry.
+    Shifts the display white point across the whole desktop via the Magnification API's
+    fullscreen colour matrix - the same multiply iOS Night Shift and Windows Night light
+    apply, so black stays black. No driver, no gamma ramp, no registry key.
 
-    Two independent knobs are blended into that single layer:
-      Dim   - how much black is mixed in (0-92)
-      Warm  - how much amber tint is mixed in (0-92)
+    Knobs, all applied as one matrix (out = in * gain + translation):
+      Dim      - -60..85. Positive darkens, negative brightens.
+      Warm     - 0..100, mapped onto 6500K..2700K.
+      Contrast - -80..100, pivoted about mid-grey so black stays black.
+      Lift     - -40..40, raises black off zero. Washes contrast out.
+
+    -Engine overlay selects the legacy translucent layered window instead, which can
+    only darken and lifts blacks as a side effect of source-over compositing.
 
 .EXAMPLE
     overlay night           # balanced warm + slight dim (default strength 50)
 .EXAMPLE
     overlay sunset 80       # heavy evening filter
 .EXAMPLE
-    overlay custom -Dim 25 -Warm 60
+    overlay light strong    # brighten instead
+.EXAMPLE
+    overlay custom -Dim -20 -Contrast 25
 .EXAMPLE
     overlay off
 #>
@@ -29,8 +36,11 @@ param(
     [Alias('s', 'Level')]
     [string]$Strength = '',
 
-    [int]$Dim = -1,
-    [int]$Warm = -1,
+    # Sentinel is MinValue, not -1: a negative Dim is meaningful (it brightens).
+    [int]$Dim = [int]::MinValue,
+    [int]$Warm = [int]::MinValue,
+    [int]$Lift = [int]::MinValue,
+    [int]$Contrast = [int]::MinValue,
     [string]$Tint = 'FF9329',
 
     # matrix  = white-point transform on the whole desktop (how Night Shift works)
@@ -49,14 +59,19 @@ $StateDir  = Join-Path $env:LOCALAPPDATA 'ScreenOverlay'
 $StateFile = Join-Path $StateDir 'state.json'
 $LogFile   = Join-Path $StateDir 'error.log'
 
-# preset = @(dim factor, warm factor), each multiplied by Strength (0-100)
+# preset = @(dim factor, warm factor, lift factor), each multiplied by Strength.
+# A negative dim factor brightens instead of darkening.
 $Presets = @{
-    'night'  = @(0.30, 0.90)
-    'warm'   = @(0.00, 0.90)
-    'dim'    = @(0.85, 0.00)
-    'dark'   = @(0.85, 0.00)
-    'sunset' = @(0.55, 1.00)
-    'sleep'  = @(0.70, 1.00)
+    'night'  = @( 0.30, 0.90, 0.00)
+    'warm'   = @( 0.00, 0.90, 0.00)
+    'dim'    = @( 0.85, 0.00, 0.00)
+    'dark'   = @( 0.85, 0.00, 0.00)
+    'sunset' = @( 0.55, 1.00, 0.00)
+    'sleep'  = @( 0.70, 1.00, 0.00)
+    # Brightening is a pure gain: black x anything is still black, so the dark
+    # parts of a UI stay dark and only lit pixels come up. Deliberately no lift.
+    'light'  = @(-0.45, 0.00, 0.00)
+    'bright' = @(-0.45, 0.00, 0.00)
 }
 
 # Named strength levels, usable anywhere a 0-100 number is.
@@ -65,7 +80,6 @@ $StrengthWords = [ordered]@{
     'faint'  = 15
     'subtle' = 15
     'low'    = 25
-    'light'  = 25
     'medium' = 50
     'med'    = 50
     'mid'    = 50
@@ -133,23 +147,53 @@ function Get-KelvinRgb([double]$kelvin) {
     return @((Clamp $r 0 255), (Clamp $g 0 255), (Clamp $b 0 255))
 }
 
-# The per-channel gains for the matrix engine. Normalised against the neutral
-# white point so warm=0 is exactly identity (no cast on an untinted screen),
-# then scaled by the dim factor. Both are multiplies, so black stays black.
-function Get-TintGains([double]$dimPct, [double]$warmPct) {
-    $d = (Clamp $dimPct 0 85) / 100.0
+# The gains for the matrix engine. Warmth is normalised against the neutral
+# white point so warm=0 is exactly identity (no cast on an untinted screen).
+#
+#   out = in * gain + translation
+#
+# gain is 1 - dim, so a negative dim brightens (gain > 1). A pure gain pivots
+# about black: 0 stays 0, so dark UI stays dark and only lit pixels come up.
+# That is what 'light' uses.
+#
+# Contrast pivots about mid-grey instead, which needs a negative translation.
+# Lift is the opposite - a positive translation that raises black off zero, and
+# so washes contrast out. It is available but is rarely what you want.
+function Get-TintGains([double]$dimPct, [double]$warmPct, [double]$liftPct = 0, [double]$contrastPct = 0) {
+    $d = (Clamp $dimPct -60 85) / 100.0
     $w = (Clamp $warmPct 0 100) / 100.0
+    $l = (Clamp $liftPct -40 40) / 100.0
+    $c = 1.0 + (Clamp $contrastPct -80 100) / 100.0
     $kelvin = $NeutralKelvin - ($NeutralKelvin - $WarmestKelvin) * $w
 
     $neutral = Get-KelvinRgb $NeutralKelvin
     $warmRgb = Get-KelvinRgb $kelvin
     $scale = 1.0 - $d
 
+    # Contrast pivots about mid-grey: out = (in - p) * c + p, which is a gain of
+    # c plus a translation of p(1 - c). For c > 1 that translation is negative,
+    # so black clamps at black instead of being lifted. Then the white point and
+    # dim gains fold in on top of it.
+    $pivot = 0.5
+    $gains = @(0, 0, 0)
+    $lifts = @(0, 0, 0)
+    for ($i = 0; $i -lt 3; $i++) {
+        $wg = Clamp ($warmRgb[$i] / $neutral[$i]) 0 1
+        $gains[$i] = $wg * $scale * $c
+        $lifts[$i] = $pivot * (1.0 - $c) * $wg * $scale + $l
+    }
+
     return [pscustomobject]@{
-        R      = [Math]::Round((Clamp ($warmRgb[0] / $neutral[0]) 0 1) * $scale, 5)
-        G      = [Math]::Round((Clamp ($warmRgb[1] / $neutral[1]) 0 1) * $scale, 5)
-        B      = [Math]::Round((Clamp ($warmRgb[2] / $neutral[2]) 0 1) * $scale, 5)
-        Kelvin = [int][Math]::Round($kelvin)
+        R        = [Math]::Round($gains[0], 5)
+        G        = [Math]::Round($gains[1], 5)
+        B        = [Math]::Round($gains[2], 5)
+        LiftR    = [Math]::Round($lifts[0], 5)
+        LiftG    = [Math]::Round($lifts[1], 5)
+        LiftB    = [Math]::Round($lifts[2], 5)
+        Lift     = [Math]::Round($l, 5)
+        Gain     = [Math]::Round($scale, 5)
+        Contrast = [Math]::Round($c, 5)
+        Kelvin   = [int][Math]::Round($kelvin)
     }
 }
 
@@ -206,7 +250,7 @@ function Get-State {
     return $null
 }
 
-function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [string]$tintHex, [string]$engine) {
+function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [double]$liftPct, [double]$contrastPct, [string]$tintHex, [string]$engine) {
     # Always run the worker under Windows PowerShell: WinForms on .NET Framework
     # is present on every Windows box, so the background process never depends on
     # which shell the user launched from.
@@ -219,6 +263,8 @@ function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [string]$tintHex
         '-Worker',
         '-Dim', ([int][Math]::Round($dimPct)),
         '-Warm', ([int][Math]::Round($warmPct)),
+        '-Lift', ([int][Math]::Round($liftPct)),
+        '-Contrast', ([int][Math]::Round($contrastPct)),
         '-Tint', $tintHex,
         '-Engine', $engine
     )
@@ -232,9 +278,11 @@ function Show-Status {
         Write-Host 'overlay: ON' -ForegroundColor Green -NoNewline
         $engineName = if ($state.PSObject.Properties['Engine']) { $state.Engine } else { 'overlay' }
         if ($engineName -eq 'matrix') {
-            $g = Get-TintGains ([double]$state.Dim) ([double]$state.Warm)
-            Write-Host ("  preset={0} strength={1} {2}K brightness={3}% engine=matrix" -f `
-                $state.Mode, $state.Strength, $g.Kelvin, [int](100 - $state.Dim))
+            $lift = if ($state.PSObject.Properties['Lift']) { [double]$state.Lift } else { 0 }
+            $con  = if ($state.PSObject.Properties['Contrast']) { [double]$state.Contrast } else { 0 }
+            $g = Get-TintGains ([double]$state.Dim) ([double]$state.Warm) $lift $con
+            Write-Host ("  preset={0} strength={1} {2}K brightness={3}% contrast={4}% lift={5} engine=matrix" -f `
+                $state.Mode, $state.Strength, $g.Kelvin, [int]($g.Gain * 100), [int]($g.Contrast * 100), [int]($g.Lift * 255))
         } else {
             Write-Host ("  preset={0} strength={1} dim={2}% warm={3}% tint=#{4} engine=overlay" -f `
                 $state.Mode, $state.Strength, $state.Dim, $state.Warm, $state.Tint)
@@ -261,19 +309,28 @@ USAGE
   overlay help                    this text
 
 PRESETS
-  night     slight dim + strong warmth   (the iOS Night Shift feel)
-  warm      warmth only, no dimming
-  dim/dark  dimming only, no colour shift
-  sunset    stronger dim + full warmth
-  sleep     heaviest dim + full warmth
+  night        slight dim + strong warmth   (the iOS Night Shift feel)
+  warm         warmth only, no dimming
+  dim/dark     dimming only, no colour shift
+  sunset       stronger dim + full warmth
+  sleep        heaviest dim + full warmth
+  light/bright the other direction - brightens the screen (matrix engine only).
+               A pure gain, so black stays black and only lit pixels come up.
 
 STRENGTH
   Any number 0-100 (default 50), or a named level:
-    faint/subtle 15   low/light 25   medium/med/mid 50
+    faint/subtle 15   low 25         medium/med/mid 50
     strong/high  75   max/full 100   off 0
+  A preset name always wins over a level name, so 'light' is the preset.
 
 OPTIONS
   -s, -Strength <n|level>   strength, as above
+  -Dim  <n>                 -60..85. Negative brightens (gain above 1).
+  -Warm <n>                 0..100, maps onto 6500K..2700K
+  -Contrast <n>             -80..100. Pivots about mid-grey, so black stays
+                            black: darks hold, brights push up.
+  -Lift <n>                 -40..40. Raises (or sinks) black off zero. Washes
+                            out contrast - usually you want -Contrast instead.
   -Engine matrix|overlay    how the tint is applied (default: matrix)
   -Tint <hex>               overlay engine only: tint colour, default FF9329.
 
@@ -320,29 +377,31 @@ public static class ScreenTint
     [DllImport("Magnification.dll")] static extern bool MagUninitialize();
     [DllImport("Magnification.dll")] static extern bool MagSetFullscreenColorEffect(float[] pEffect);
 
-    static float[] Diagonal(float r, float g, float b)
+    // out = in * gain + lift. The diagonal is the per-channel gain; the last
+    // row is the translation, which is what lifts blacks off zero.
+    static float[] Matrix(float r, float g, float b, float lr, float lg, float lb)
     {
         return new float[25] {
             r, 0, 0, 0, 0,
             0, g, 0, 0, 0,
             0, 0, b, 0, 0,
             0, 0, 0, 1, 0,
-            0, 0, 0, 0, 1
+            lr, lg, lb, 0, 1
         };
     }
 
     public static bool Init()     { return MagInitialize(); }
     public static bool Shutdown() { return MagUninitialize(); }
 
-    public static bool Apply(float r, float g, float b)
+    public static bool Apply(float r, float g, float b, float lr, float lg, float lb)
     {
-        return MagSetFullscreenColorEffect(Diagonal(r, g, b));
+        return MagSetFullscreenColorEffect(Matrix(r, g, b, lr, lg, lb));
     }
 
     // Identity - puts the screen back exactly as it was.
     public static bool Reset()
     {
-        return MagSetFullscreenColorEffect(Diagonal(1, 1, 1));
+        return MagSetFullscreenColorEffect(Matrix(1, 1, 1, 0, 0, 0));
     }
 }
 '@
@@ -385,13 +444,15 @@ if ($Worker) {
             try {
                 Use-ScreenTint
                 if ([ScreenTint]::Init()) {
-                    $gains = Get-TintGains ([double]$Dim) ([double]$Warm)
-                    if ([ScreenTint]::Apply($gains.R, $gains.G, $gains.B)) {
+                    $liftArg = if ($Lift -eq [int]::MinValue) { 0 } else { $Lift }
+                    $contrastArg = if ($Contrast -eq [int]::MinValue) { 0 } else { $Contrast }
+                    $gains = Get-TintGains ([double]$Dim) ([double]$Warm) ([double]$liftArg) ([double]$contrastArg)
+                    if ([ScreenTint]::Apply($gains.R, $gains.G, $gains.B, $gains.LiftR, $gains.LiftG, $gains.LiftB)) {
                         $applied = $true
                         # Re-assert periodically: a resolution change, another
                         # magnifier client or a session switch can drop it.
                         while (-not $stopEvent.WaitOne(2000)) {
-                            [void][ScreenTint]::Apply($gains.R, $gains.G, $gains.B)
+                            [void][ScreenTint]::Apply($gains.R, $gains.G, $gains.B, $gains.LiftR, $gains.LiftG, $gains.LiftB)
                         }
                         [void][ScreenTint]::Reset()
                     }
@@ -568,7 +629,8 @@ if ($requested -eq 'off') {
 }
 
 # "overlay 40" / "overlay medium" - a bare strength implies the night preset.
-if (Test-StrengthToken $requested) {
+# A preset name always wins, so 'light' stays the brighten preset.
+if (-not $Presets.ContainsKey($requested) -and (Test-StrengthToken $requested)) {
     if ([string]::IsNullOrWhiteSpace($Strength)) { $Strength = $requested }
     $requested = 'night'
 }
@@ -599,6 +661,12 @@ if ($requested -eq 'more' -or $requested -eq 'less') {
             $ratio = $strengthNum / [double]$baseStrength
             $Dim  = [int][Math]::Round(([double]$state.Dim) * $ratio)
             $Warm = [int][Math]::Round(([double]$state.Warm) * $ratio)
+            if ($state.PSObject.Properties['Lift']) {
+                $Lift = [int][Math]::Round(([double]$state.Lift) * $ratio)
+            }
+            if ($state.PSObject.Properties['Contrast']) {
+                $Contrast = [int][Math]::Round(([double]$state.Contrast) * $ratio)
+            }
         } else {
             $requested = 'night'
         }
@@ -607,18 +675,25 @@ if ($requested -eq 'more' -or $requested -eq 'less') {
     $Strength = [string]$strengthNum
 }
 
-# Resolve dim / warm ----------------------------------------------------------
+# Resolve dim / warm / lift ---------------------------------------------------
 $dimPct  = 0.0
 $warmPct = 0.0
+$liftPct = 0.0
+$contrastPct = 0.0
 
 if ($requested -eq 'custom') {
-    if ($Dim -lt 0 -and $Warm -lt 0) {
-        Write-Host 'custom needs -Dim and/or -Warm, e.g. overlay custom -Dim 25 -Warm 60' -ForegroundColor Yellow
+    if ($Dim -eq [int]::MinValue -and $Warm -eq [int]::MinValue -and
+        $Lift -eq [int]::MinValue -and $Contrast -eq [int]::MinValue) {
+        Write-Host 'custom needs -Dim, -Warm, -Contrast and/or -Lift' -ForegroundColor Yellow
+        Write-Host 'e.g. overlay custom -Dim 25 -Warm 60   /   overlay custom -Dim -30 -Contrast 20' -ForegroundColor DarkGray
         exit 1
     }
-    if ($Dim  -lt 0) { $dimPct  = 0.0 } else { $dimPct  = [double]$Dim }
-    if ($Warm -lt 0) { $warmPct = 0.0 } else { $warmPct = [double]$Warm }
-    $strengthNum = [int][Math]::Round([Math]::Max($dimPct, $warmPct))
+    if ($Dim  -eq [int]::MinValue) { $dimPct  = 0.0 } else { $dimPct  = [double]$Dim }
+    if ($Warm -eq [int]::MinValue) { $warmPct = 0.0 } else { $warmPct = [double]$Warm }
+    if ($Lift -eq [int]::MinValue) { $liftPct = 0.0 } else { $liftPct = [double]$Lift }
+    if ($Contrast -eq [int]::MinValue) { $contrastPct = 0.0 } else { $contrastPct = [double]$Contrast }
+    $strengthNum = [int][Math]::Round([Math]::Max([Math]::Abs($dimPct),
+                       [Math]::Max($warmPct, [Math]::Max([Math]::Abs($liftPct), [Math]::Abs($contrastPct)))))
 } elseif ($Presets.ContainsKey($requested)) {
     try {
         $strengthNum = Resolve-Strength $Strength 50
@@ -636,18 +711,38 @@ if ($requested -eq 'custom') {
     $factors = $Presets[$requested]
     $dimPct  = $factors[0] * $strengthNum
     $warmPct = $factors[1] * $strengthNum
+    $liftPct = $factors[2] * $strengthNum
 } else {
     Write-Host "Unknown command '$Mode'. Try: overlay help" -ForegroundColor Yellow
     exit 1
 }
 
-$dimPct  = Clamp $dimPct 0 92
-$warmPct = Clamp $warmPct 0 92
+if ($Engine -eq 'matrix') {
+    $dimPct  = Clamp $dimPct -60 85
+    $warmPct = Clamp $warmPct 0 100
+    $liftPct = Clamp $liftPct -40 40
+    $contrastPct = Clamp $contrastPct -80 100
+} else {
+    if ($dimPct -lt 0 -or $liftPct -ne 0 -or $contrastPct -ne 0) {
+        Write-Host 'brightening and contrast need the matrix engine - a layered window can only darken.' -ForegroundColor Yellow
+        Write-Host 'drop -Engine overlay, or use a darkening preset.' -ForegroundColor DarkGray
+        exit 1
+    }
+    $dimPct  = Clamp $dimPct 0 92
+    $warmPct = Clamp $warmPct 0 92
+}
 
 $rgb = ConvertFrom-HexColour $Tint
-$layer = Get-BlendedLayer $dimPct $warmPct $rgb
-if ($null -eq $layer) {
+$layer = Get-BlendedLayer ([Math]::Max($dimPct, 0)) $warmPct $rgb
+
+if ($Engine -eq 'matrix') {
+    $nothingToDo = ($dimPct -eq 0 -and $warmPct -eq 0 -and $liftPct -eq 0 -and $contrastPct -eq 0)
+} else {
+    $nothingToDo = ($null -eq $layer)
+}
+if ($nothingToDo) {
     [void](Stop-Overlay)
+    Reset-ScreenTint
     if (Test-Path $StateFile) { Remove-Item $StateFile -Force }
     Write-Host 'overlay: off (nothing to apply)' -ForegroundColor DarkGray
     exit 0
@@ -655,7 +750,7 @@ if ($null -eq $layer) {
 
 # No need to reset the matrix first - applying a new one overwrites it.
 [void](Stop-Overlay)
-Start-OverlayWorker $dimPct $warmPct ($Tint.TrimStart('#').ToUpperInvariant()) $Engine
+Start-OverlayWorker $dimPct $warmPct $liftPct $contrastPct ($Tint.TrimStart('#').ToUpperInvariant()) $Engine
 
 $deadline = [DateTime]::UtcNow.AddSeconds(15)
 while (-not (Test-OverlayRunning) -and [DateTime]::UtcNow -lt $deadline) {
@@ -668,18 +763,25 @@ if (Test-OverlayRunning) {
         Strength = $strengthNum
         Dim      = [int][Math]::Round($dimPct)
         Warm     = [int][Math]::Round($warmPct)
+        Lift     = [int][Math]::Round($liftPct)
+        Contrast = [int][Math]::Round($contrastPct)
         Tint     = $Tint.TrimStart('#').ToUpperInvariant()
         Engine   = $Engine
-        Opacity  = $layer.Opacity
+        Opacity  = if ($layer) { $layer.Opacity } else { $null }
         Started  = (Get-Date).ToString('s')
     })
     if ($Engine -eq 'matrix') {
         # Report what the worker actually applies: it is handed rounded ints.
         $dimApplied  = [int][Math]::Round($dimPct)
         $warmApplied = [int][Math]::Round($warmPct)
-        $gains = Get-TintGains $dimApplied $warmApplied
-        Write-Host ('overlay: {0} @ {1}  ({2}K, brightness {3}%)' -f `
-            $requested, $strengthNum, $gains.Kelvin, [int](100 - $dimApplied)) -ForegroundColor Green
+        $liftApplied = [int][Math]::Round($liftPct)
+        $contrastApplied = [int][Math]::Round($contrastPct)
+        $gains = Get-TintGains $dimApplied $warmApplied $liftApplied $contrastApplied
+        $detail = 'brightness {0}%' -f [int]($gains.Gain * 100)
+        if ($contrastApplied -ne 0) { $detail += ', contrast {0}%' -f [int]($gains.Contrast * 100) }
+        if ($liftApplied -ne 0) { $detail += ', black lift {0}' -f [int]($gains.Lift * 255) }
+        if ($warmApplied -gt 0) { $detail = '{0}K, {1}' -f $gains.Kelvin, $detail }
+        Write-Host ('overlay: {0} @ {1}  ({2})' -f $requested, $strengthNum, $detail) -ForegroundColor Green
     } else {
         Write-Host ('overlay: {0} @ {1}  (dim {2}%, warm {3}%)' -f `
             $requested, $strengthNum, [int]$dimPct, [int]$warmPct) -ForegroundColor Green

@@ -31,6 +31,7 @@ C:\programming\claude\overlay\overlay.cmd <preset> [strength]
 | `dark` (or `dim`) | dimming only, no colour shift |
 | `sunset` | stronger dim + full warmth |
 | `sleep` | heaviest dim + full warmth |
+| `light` (or `bright`) | the opposite — brightens the screen |
 
 ## Strength
 
@@ -48,7 +49,9 @@ overlay dark strong        # dimming only, 75
 overlay night -s 65        # explicit strength flag
 overlay medium             # bare strength => night preset
 overlay 30                 # bare number => night preset
-overlay custom -Dim 40 -Warm 55    # exact control, each 0-92
+overlay light strong       # brighten
+overlay custom -Dim -20 -Contrast 25   # brighter and punchier
+overlay custom -Dim 40 -Warm 55    # dim -60..85, warm 0-100, contrast -80..100
 overlay more               # +10 strength (or 'overlay more 25')
 overlay less               # -10 strength
 overlay off                # remove it
@@ -58,6 +61,14 @@ overlay status             # what is currently applied
 Warmth is a real colour temperature: strength `0` = 6500K (neutral), `100` =
 2700K (iOS's warmest). `dark` is a pure neutral multiply with no colour shift.
 
+`light` goes the other way: a pure gain above 1, pivoted at black, so black
+stays black and only lit pixels come up.
+
+`-Contrast N` (-80..100) pivots about mid-grey instead — darks hold, brights
+push up, black still stays black. `-Lift N` raises black off zero, which does
+lighten a dark UI but goes hazy; prefer `-Contrast`. Both need the matrix
+engine.
+
 `-Engine overlay` switches to the legacy translucent-window approach, which
 lifts blacks. Only use it if the default visibly fails. `-Tint <hex>` applies
 to that engine only.
@@ -65,6 +76,8 @@ to that engine only.
 ## Choosing for the user
 
 - "too bright" / "darker" / "turn dark on" → `dark` (dimming only)
+- "too dark" / "brighter" / "lighter" / "I can't read this" → `light`
+- "washed out" / "more punch" / "more contrast" → `custom -Contrast 25`
 - "night mode" / "warmer" / "less blue" → `night`
 - "way too bright, it's late" → `sunset` or `sleep`
 - "a bit more/less" → `more` / `less`, not a fresh preset
