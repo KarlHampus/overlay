@@ -10,7 +10,8 @@
     Knobs, all applied as one matrix (out = in * gain + translation):
       Dim      - -60..85. Positive darkens, negative brightens.
       Warm     - 0..100, mapped onto 6500K..2700K.
-      Contrast - -80..100, pivoted about mid-grey so black stays black.
+      Contrast - -80..100. Tones above the pivot brighten, below it darken.
+      Pivot    - 0..100, the brightness that contrast leaves untouched (default 50).
       Lift     - -40..40, raises black off zero. Washes contrast out.
 
     -Engine overlay selects the legacy translucent layered window instead, which can
@@ -41,6 +42,7 @@ param(
     [int]$Warm = [int]::MinValue,
     [int]$Lift = [int]::MinValue,
     [int]$Contrast = [int]::MinValue,
+    [int]$Pivot = [int]::MinValue,
     [string]$Tint = 'FF9329',
 
     # matrix  = white-point transform on the whole desktop (how Night Shift works)
@@ -156,10 +158,11 @@ function Get-KelvinRgb([double]$kelvin) {
 # about black: 0 stays 0, so dark UI stays dark and only lit pixels come up.
 # That is what 'light' uses.
 #
-# Contrast pivots about mid-grey instead, which needs a negative translation.
-# Lift is the opposite - a positive translation that raises black off zero, and
-# so washes contrast out. It is available but is rarely what you want.
-function Get-TintGains([double]$dimPct, [double]$warmPct, [double]$liftPct = 0, [double]$contrastPct = 0) {
+# Contrast hinges about a chosen tone instead, which needs a negative
+# translation. Lift is the opposite - a positive translation that raises black
+# off zero, and so washes contrast out. Rarely what you want.
+function Get-TintGains([double]$dimPct, [double]$warmPct, [double]$liftPct = 0,
+                       [double]$contrastPct = 0, [double]$pivotPct = 50) {
     $d = (Clamp $dimPct -60 85) / 100.0
     $w = (Clamp $warmPct 0 100) / 100.0
     $l = (Clamp $liftPct -40 40) / 100.0
@@ -170,11 +173,15 @@ function Get-TintGains([double]$dimPct, [double]$warmPct, [double]$liftPct = 0, 
     $warmRgb = Get-KelvinRgb $kelvin
     $scale = 1.0 - $d
 
-    # Contrast pivots about mid-grey: out = (in - p) * c + p, which is a gain of
-    # c plus a translation of p(1 - c). For c > 1 that translation is negative,
-    # so black clamps at black instead of being lifted. Then the white point and
-    # dim gains fold in on top of it.
-    $pivot = 0.5
+    # Contrast pivots about a chosen tone: out = (in - p) * c + p, which is a
+    # gain of c plus a translation of p(1 - c). For c > 1 that translation is
+    # negative, so black clamps at black instead of being lifted. Then the white
+    # point and dim gains fold in on top of it.
+    #
+    # p is where the hinge sits. p = 0.5 is a classic contrast curve. A low p
+    # (say 0.1) leaves the darkest tones alone and brightens everything above
+    # them; a high p darkens most of the image and lifts only the highlights.
+    $pivot = (Clamp $pivotPct 0 100) / 100.0
     $gains = @(0, 0, 0)
     $lifts = @(0, 0, 0)
     for ($i = 0; $i -lt 3; $i++) {
@@ -193,6 +200,7 @@ function Get-TintGains([double]$dimPct, [double]$warmPct, [double]$liftPct = 0, 
         Lift     = [Math]::Round($l, 5)
         Gain     = [Math]::Round($scale, 5)
         Contrast = [Math]::Round($c, 5)
+        Pivot    = [Math]::Round($pivot, 5)
         Kelvin   = [int][Math]::Round($kelvin)
     }
 }
@@ -250,7 +258,8 @@ function Get-State {
     return $null
 }
 
-function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [double]$liftPct, [double]$contrastPct, [string]$tintHex, [string]$engine) {
+function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [double]$liftPct,
+                             [double]$contrastPct, [double]$pivotPct, [string]$tintHex, [string]$engine) {
     # Always run the worker under Windows PowerShell: WinForms on .NET Framework
     # is present on every Windows box, so the background process never depends on
     # which shell the user launched from.
@@ -265,6 +274,7 @@ function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [double]$liftPct
         '-Warm', ([int][Math]::Round($warmPct)),
         '-Lift', ([int][Math]::Round($liftPct)),
         '-Contrast', ([int][Math]::Round($contrastPct)),
+        '-Pivot', ([int][Math]::Round($pivotPct)),
         '-Tint', $tintHex,
         '-Engine', $engine
     )
@@ -280,9 +290,10 @@ function Show-Status {
         if ($engineName -eq 'matrix') {
             $lift = if ($state.PSObject.Properties['Lift']) { [double]$state.Lift } else { 0 }
             $con  = if ($state.PSObject.Properties['Contrast']) { [double]$state.Contrast } else { 0 }
-            $g = Get-TintGains ([double]$state.Dim) ([double]$state.Warm) $lift $con
-            Write-Host ("  preset={0} strength={1} {2}K brightness={3}% contrast={4}% lift={5} engine=matrix" -f `
-                $state.Mode, $state.Strength, $g.Kelvin, [int]($g.Gain * 100), [int]($g.Contrast * 100), [int]($g.Lift * 255))
+            $piv  = if ($state.PSObject.Properties['Pivot']) { [double]$state.Pivot } else { 50 }
+            $g = Get-TintGains ([double]$state.Dim) ([double]$state.Warm) $lift $con $piv
+            Write-Host ("  preset={0} strength={1} {2}K brightness={3}% contrast={4}%@{5}% lift={6} engine=matrix" -f `
+                $state.Mode, $state.Strength, $g.Kelvin, [int]($g.Gain * 100), [int]($g.Contrast * 100), [int]($g.Pivot * 100), [int]($g.Lift * 255))
         } else {
             Write-Host ("  preset={0} strength={1} dim={2}% warm={3}% tint=#{4} engine=overlay" -f `
                 $state.Mode, $state.Strength, $state.Dim, $state.Warm, $state.Tint)
@@ -327,8 +338,12 @@ OPTIONS
   -s, -Strength <n|level>   strength, as above
   -Dim  <n>                 -60..85. Negative brightens (gain above 1).
   -Warm <n>                 0..100, maps onto 6500K..2700K
-  -Contrast <n>             -80..100. Pivots about mid-grey, so black stays
-                            black: darks hold, brights push up.
+  -Contrast <n>             -80..100. Tones above the pivot get brighter, tones
+                            below it get darker. Black stays black.
+  -Pivot <n>                0..100, default 50. The brightness contrast leaves
+                            untouched. -Pivot 10 holds the darkest tones and
+                            brightens everything above them; -Pivot 90 darkens
+                            most of the image and lifts only the highlights.
   -Lift <n>                 -40..40. Raises (or sinks) black off zero. Washes
                             out contrast - usually you want -Contrast instead.
   -Engine matrix|overlay    how the tint is applied (default: matrix)
@@ -446,7 +461,9 @@ if ($Worker) {
                 if ([ScreenTint]::Init()) {
                     $liftArg = if ($Lift -eq [int]::MinValue) { 0 } else { $Lift }
                     $contrastArg = if ($Contrast -eq [int]::MinValue) { 0 } else { $Contrast }
-                    $gains = Get-TintGains ([double]$Dim) ([double]$Warm) ([double]$liftArg) ([double]$contrastArg)
+                    $pivotArg = if ($Pivot -eq [int]::MinValue) { 50 } else { $Pivot }
+                    $gains = Get-TintGains ([double]$Dim) ([double]$Warm) ([double]$liftArg) `
+                                           ([double]$contrastArg) ([double]$pivotArg)
                     if ([ScreenTint]::Apply($gains.R, $gains.G, $gains.B, $gains.LiftR, $gains.LiftG, $gains.LiftB)) {
                         $applied = $true
                         # Re-assert periodically: a resolution change, another
@@ -667,6 +684,9 @@ if ($requested -eq 'more' -or $requested -eq 'less') {
             if ($state.PSObject.Properties['Contrast']) {
                 $Contrast = [int][Math]::Round(([double]$state.Contrast) * $ratio)
             }
+            # The pivot is a position on the tone curve, not an amount - it does
+            # not scale with strength.
+            if ($state.PSObject.Properties['Pivot']) { $Pivot = [int]$state.Pivot }
         } else {
             $requested = 'night'
         }
@@ -680,10 +700,12 @@ $dimPct  = 0.0
 $warmPct = 0.0
 $liftPct = 0.0
 $contrastPct = 0.0
+$pivotPct = 50.0
 
 if ($requested -eq 'custom') {
     if ($Dim -eq [int]::MinValue -and $Warm -eq [int]::MinValue -and
-        $Lift -eq [int]::MinValue -and $Contrast -eq [int]::MinValue) {
+        $Lift -eq [int]::MinValue -and $Contrast -eq [int]::MinValue -and
+        $Pivot -eq [int]::MinValue) {
         Write-Host 'custom needs -Dim, -Warm, -Contrast and/or -Lift' -ForegroundColor Yellow
         Write-Host 'e.g. overlay custom -Dim 25 -Warm 60   /   overlay custom -Dim -30 -Contrast 20' -ForegroundColor DarkGray
         exit 1
@@ -692,6 +714,13 @@ if ($requested -eq 'custom') {
     if ($Warm -eq [int]::MinValue) { $warmPct = 0.0 } else { $warmPct = [double]$Warm }
     if ($Lift -eq [int]::MinValue) { $liftPct = 0.0 } else { $liftPct = [double]$Lift }
     if ($Contrast -eq [int]::MinValue) { $contrastPct = 0.0 } else { $contrastPct = [double]$Contrast }
+    if ($Pivot -ne [int]::MinValue) {
+        if ($Contrast -eq [int]::MinValue) {
+            Write-Host '-Pivot only does anything alongside -Contrast: it is the tone contrast leaves untouched.' -ForegroundColor Yellow
+            exit 1
+        }
+        $pivotPct = [double]$Pivot
+    }
     $strengthNum = [int][Math]::Round([Math]::Max([Math]::Abs($dimPct),
                        [Math]::Max($warmPct, [Math]::Max([Math]::Abs($liftPct), [Math]::Abs($contrastPct)))))
 } elseif ($Presets.ContainsKey($requested)) {
@@ -722,6 +751,7 @@ if ($Engine -eq 'matrix') {
     $warmPct = Clamp $warmPct 0 100
     $liftPct = Clamp $liftPct -40 40
     $contrastPct = Clamp $contrastPct -80 100
+    $pivotPct = Clamp $pivotPct 0 100
 } else {
     if ($dimPct -lt 0 -or $liftPct -ne 0 -or $contrastPct -ne 0) {
         Write-Host 'brightening and contrast need the matrix engine - a layered window can only darken.' -ForegroundColor Yellow
@@ -750,7 +780,7 @@ if ($nothingToDo) {
 
 # No need to reset the matrix first - applying a new one overwrites it.
 [void](Stop-Overlay)
-Start-OverlayWorker $dimPct $warmPct $liftPct $contrastPct ($Tint.TrimStart('#').ToUpperInvariant()) $Engine
+Start-OverlayWorker $dimPct $warmPct $liftPct $contrastPct $pivotPct ($Tint.TrimStart('#').ToUpperInvariant()) $Engine
 
 $deadline = [DateTime]::UtcNow.AddSeconds(15)
 while (-not (Test-OverlayRunning) -and [DateTime]::UtcNow -lt $deadline) {
@@ -765,6 +795,7 @@ if (Test-OverlayRunning) {
         Warm     = [int][Math]::Round($warmPct)
         Lift     = [int][Math]::Round($liftPct)
         Contrast = [int][Math]::Round($contrastPct)
+        Pivot    = [int][Math]::Round($pivotPct)
         Tint     = $Tint.TrimStart('#').ToUpperInvariant()
         Engine   = $Engine
         Opacity  = if ($layer) { $layer.Opacity } else { $null }
@@ -776,9 +807,12 @@ if (Test-OverlayRunning) {
         $warmApplied = [int][Math]::Round($warmPct)
         $liftApplied = [int][Math]::Round($liftPct)
         $contrastApplied = [int][Math]::Round($contrastPct)
-        $gains = Get-TintGains $dimApplied $warmApplied $liftApplied $contrastApplied
+        $pivotApplied = [int][Math]::Round($pivotPct)
+        $gains = Get-TintGains $dimApplied $warmApplied $liftApplied $contrastApplied $pivotApplied
         $detail = 'brightness {0}%' -f [int]($gains.Gain * 100)
-        if ($contrastApplied -ne 0) { $detail += ', contrast {0}%' -f [int]($gains.Contrast * 100) }
+        if ($contrastApplied -ne 0) {
+            $detail += ', contrast {0}% about {1}%' -f [int]($gains.Contrast * 100), [int]($gains.Pivot * 100)
+        }
         if ($liftApplied -ne 0) { $detail += ', black lift {0}' -f [int]($gains.Lift * 255) }
         if ($warmApplied -gt 0) { $detail = '{0}K, {1}' -f $gains.Kelvin, $detail }
         Write-Host ('overlay: {0} @ {1}  ({2})' -f $requested, $strengthNum, $detail) -ForegroundColor Green

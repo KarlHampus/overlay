@@ -64,10 +64,14 @@ Warmth is a real colour temperature: strength `0` = 6500K (neutral), `100` =
 `light` goes the other way: a pure gain above 1, pivoted at black, so black
 stays black and only lit pixels come up.
 
-`-Contrast N` (-80..100) pivots about mid-grey instead — darks hold, brights
-push up, black still stays black. `-Lift N` raises black off zero, which does
-lighten a dark UI but goes hazy; prefer `-Contrast`. Both need the matrix
-engine.
+`-Contrast N` (-80..100) hinges the tone curve: above the hinge gets brighter,
+below it gets darker, black still stays black. `-Pivot N` (0..100, default 50)
+sets where the hinge sits — `-Pivot 10` holds the darkest tones and brightens
+everything above them, `-Pivot 90` darkens most of the image and lifts only
+highlights. `-Pivot` does nothing without `-Contrast`.
+
+`-Lift N` raises black off zero, which lightens a dark UI but goes hazy; prefer
+`-Contrast`. All of these need the matrix engine.
 
 `-Engine overlay` switches to the legacy translucent-window approach, which
 lifts blacks. Only use it if the default visibly fails. `-Tint <hex>` applies
@@ -78,6 +82,7 @@ to that engine only.
 - "too bright" / "darker" / "turn dark on" → `dark` (dimming only)
 - "too dark" / "brighter" / "lighter" / "I can't read this" → `light`
 - "washed out" / "more punch" / "more contrast" → `custom -Contrast 25`
+- "lighter but keep the blacks black" → `custom -Contrast 30 -Pivot 10`
 - "night mode" / "warmer" / "less blue" → `night`
 - "way too bright, it's late" → `sunset` or `sleep`
 - "a bit more/less" → `more` / `less`, not a fresh preset

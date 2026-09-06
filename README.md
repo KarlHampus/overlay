@@ -40,7 +40,7 @@ Run box; `overlay.ps1` can be called directly too.
 | `overlay sunset [strength]` | stronger dim + full warmth |
 | `overlay sleep [strength]` | heaviest dim + full warmth |
 | `overlay light [strength]` | the other direction — brightens, black stays black (`bright` is a synonym) |
-| `overlay custom -Dim N -Warm N -Contrast N -Lift N` | exact control: dim -60..85, warm 0-100, contrast -80..100, lift -40..40 |
+| `overlay custom -Dim N -Warm N -Contrast N -Pivot N -Lift N` | exact control: dim -60..85, warm 0-100, contrast -80..100, pivot 0-100, lift -40..40 |
 | `overlay more` / `overlay less` | nudge the current strength by 10 |
 | `overlay off` | remove the overlay |
 | `overlay` / `overlay status` | show what is currently applied |
@@ -137,26 +137,42 @@ zero so dark UI got lighter too. It works, but it trades away contrast and makes
 the screen look hazy, so it is no longer what `light` does. `-Lift` is still
 there if you want it.
 
-### Contrast
+### Contrast, and where it hinges
 
-`-Contrast N` pivots about mid-grey rather than about black:
+`-Contrast N` hinges the tone curve about a chosen brightness:
 
 ```
-out = (in - 0.5) * c + 0.5        c = 1 + N/100
+out = (in - p) * c + p        c = 1 + N/100,  p = -Pivot/100
 ```
 
-which is a gain of `c` plus a *negative* translation of `0.5(1 - c)`. Blacks
-clamp at black, whites push toward white, midtones spread apart. `-Contrast 30`
-produces gain `1.3`, translation `-0.15`; a black pixel computes to `-0.15` and
-clamps to 0, mid-grey stays exactly mid-grey.
+which is a gain of `c` plus a *negative* translation of `p(1 - c)`. Tones above
+`p` get brighter, tones below it get darker, and `p` itself is left untouched.
+Black computes negative and clamps at black either way.
 
-It composes with everything else — `overlay custom -Dim -20 -Contrast 25` gives
-gain `1.5` with translation `-0.15`: brighter *and* punchier.
+`-Pivot` (0-100, default 50) is where that hinge sits, and it changes the
+character completely:
+
+| | gain | translation | untouched at | effect |
+| --- | --- | --- | --- | --- |
+| `-Contrast 30` | 1.3 | -0.15 | 50% | classic contrast curve |
+| `-Contrast 30 -Pivot 10` | 1.3 | -0.03 | 10% | darkest tones hold, everything above brightens |
+| `-Contrast 30 -Pivot 90` | 1.3 | -0.27 | 90% | most of the image darkens, only highlights lift |
+| `-Contrast 60 -Pivot 10` | 1.6 | -0.06 | 10% | same hinge, much harder curve |
+
+A low pivot is the useful one for "make it lighter without washing out": dark
+pixels stay dark, and everything brighter than them opens up. A high pivot does
+the opposite — it crushes the image down and lets only the brightest through.
+
+Verified by solving `in * gain + translation = in` on the live matrix read back
+from Windows; the fixed point lands on the requested pivot in every case above.
+
+Contrast composes with everything else — `overlay custom -Dim -20 -Contrast 25`
+gives gain `1.5` with translation `-0.15`: brighter *and* punchier.
 
 | Knob | Pivot | Black | Effect |
 | --- | --- | --- | --- |
 | `-Dim` negative (`light`) | black | stays black | brightens everything lit |
-| `-Contrast` positive | mid-grey | stays black | darks hold, brights push up |
+| `-Contrast` positive | `-Pivot`, default mid-grey | stays black | above the pivot brightens, below it darkens |
 | `-Lift` positive | — | **raised** | lighter but hazy, contrast lost |
 
 Brightening and contrast require the matrix engine; a layered window can only

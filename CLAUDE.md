@@ -73,16 +73,23 @@ translation row (indices 20-22) respectively. Three ways to move it:
 | Knob | Pivot | Black | Matrix |
 | --- | --- | --- | --- |
 | `-Dim` negative (`light`) | black | stays black | gain > 1, translation 0 |
-| `-Contrast` positive | mid-grey | stays black | gain `c`, translation `0.5(1-c)` |
+| `-Contrast` positive | `-Pivot` p, default 0.5 | stays black | gain `c`, translation `p(1-c)` |
 | `-Lift` positive | - | raised | translation > 0 |
 
 `light` is deliberately a **pure gain, no lift**. An earlier cut added lift so
 dark UI would lighten too; it works but goes hazy and loses contrast, and the
 user asked for contrast instead. Do not reintroduce lift into that preset.
 
-Verified by reading the live matrix back with `MagGetFullscreenColorEffect`:
-`light medium` -> gain 1.22 / translation 0; `-Contrast 30` -> 1.3 / -0.15;
-`-Dim -20 -Contrast 25` -> 1.5 / -0.15.
+`-Pivot` is a position on the tone curve, not an amount, so `more`/`less` must
+*not* scale it - only Dim/Warm/Contrast/Lift scale with strength. It is also a
+no-op without `-Contrast` (translation is `p(1-c)`, which is 0 when c = 1), and
+the front end says so rather than silently doing nothing.
+
+Verified by reading the live matrix back with `MagGetFullscreenColorEffect` and
+solving `in * gain + translation = in` for the fixed point:
+`light medium` -> 1.22 / 0; `-Contrast 30` -> 1.3 / -0.15, fixed at 50%;
+`-Pivot 10` -> 1.3 / -0.03, fixed at 10%; `-Pivot 90` -> 1.3 / -0.27, fixed
+at 90%.
 
 **overlay** — the original layered window. Kept because it is the fallback, and
 because `-Tint` only means anything there. It cannot brighten at all, so the
