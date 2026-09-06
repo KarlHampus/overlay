@@ -32,6 +32,12 @@ param(
     [int]$Dim = -1,
     [int]$Warm = -1,
     [string]$Tint = 'FF9329',
+
+    # matrix  = white-point transform on the whole desktop (how Night Shift works)
+    # overlay = translucent layered window (the old way; lifts blacks)
+    [ValidateSet('matrix', 'overlay')]
+    [string]$Engine = 'matrix',
+
     [switch]$Worker
 )
 
@@ -107,6 +113,46 @@ function ConvertFrom-HexColour([string]$hex) {
     )
 }
 
+# Night Shift shifts the display white point between roughly these two points.
+$NeutralKelvin = 6500
+$WarmestKelvin = 2700
+
+# Blackbody colour temperature -> RGB, Tanner Helland's approximation.
+function Get-KelvinRgb([double]$kelvin) {
+    $t = $kelvin / 100.0
+    if ($t -le 66) {
+        $r = 255.0
+        $g = 99.4708025861 * [Math]::Log($t) - 161.1195681661
+    } else {
+        $r = 329.698727446 * [Math]::Pow($t - 60, -0.1332047592)
+        $g = 288.1221695283 * [Math]::Pow($t - 60, -0.0755148492)
+    }
+    if ($t -ge 66)      { $b = 255.0 }
+    elseif ($t -le 19)  { $b = 0.0 }
+    else                { $b = 138.5177312231 * [Math]::Log($t - 10) - 305.0447927307 }
+    return @((Clamp $r 0 255), (Clamp $g 0 255), (Clamp $b 0 255))
+}
+
+# The per-channel gains for the matrix engine. Normalised against the neutral
+# white point so warm=0 is exactly identity (no cast on an untinted screen),
+# then scaled by the dim factor. Both are multiplies, so black stays black.
+function Get-TintGains([double]$dimPct, [double]$warmPct) {
+    $d = (Clamp $dimPct 0 85) / 100.0
+    $w = (Clamp $warmPct 0 100) / 100.0
+    $kelvin = $NeutralKelvin - ($NeutralKelvin - $WarmestKelvin) * $w
+
+    $neutral = Get-KelvinRgb $NeutralKelvin
+    $warmRgb = Get-KelvinRgb $kelvin
+    $scale = 1.0 - $d
+
+    return [pscustomobject]@{
+        R      = [Math]::Round((Clamp ($warmRgb[0] / $neutral[0]) 0 1) * $scale, 5)
+        G      = [Math]::Round((Clamp ($warmRgb[1] / $neutral[1]) 0 1) * $scale, 5)
+        B      = [Math]::Round((Clamp ($warmRgb[2] / $neutral[2]) 0 1) * $scale, 5)
+        Kelvin = [int][Math]::Round($kelvin)
+    }
+}
+
 # Collapse a black layer (dim) and an amber layer (warm) into the single
 # colour + alpha that one layered window can express:
 #   screen -> amber at w -> black at d
@@ -160,7 +206,7 @@ function Get-State {
     return $null
 }
 
-function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [string]$tintHex) {
+function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [string]$tintHex, [string]$engine) {
     # Always run the worker under Windows PowerShell: WinForms on .NET Framework
     # is present on every Windows box, so the background process never depends on
     # which shell the user launched from.
@@ -173,7 +219,8 @@ function Start-OverlayWorker([double]$dimPct, [double]$warmPct, [string]$tintHex
         '-Worker',
         '-Dim', ([int][Math]::Round($dimPct)),
         '-Warm', ([int][Math]::Round($warmPct)),
-        '-Tint', $tintHex
+        '-Tint', $tintHex,
+        '-Engine', $engine
     )
     Start-Process -FilePath $hostExe -ArgumentList $argList -WindowStyle Hidden | Out-Null
 }
@@ -183,8 +230,15 @@ function Show-Status {
     $state = Get-State
     if ($running -and $state) {
         Write-Host 'overlay: ON' -ForegroundColor Green -NoNewline
-        Write-Host ("  preset={0} strength={1} dim={2}% warm={3}% tint=#{4}" -f `
-            $state.Mode, $state.Strength, $state.Dim, $state.Warm, $state.Tint)
+        $engineName = if ($state.PSObject.Properties['Engine']) { $state.Engine } else { 'overlay' }
+        if ($engineName -eq 'matrix') {
+            $g = Get-TintGains ([double]$state.Dim) ([double]$state.Warm)
+            Write-Host ("  preset={0} strength={1} {2}K brightness={3}% engine=matrix" -f `
+                $state.Mode, $state.Strength, $g.Kelvin, [int](100 - $state.Dim))
+        } else {
+            Write-Host ("  preset={0} strength={1} dim={2}% warm={3}% tint=#{4} engine=overlay" -f `
+                $state.Mode, $state.Strength, $state.Dim, $state.Warm, $state.Tint)
+        }
     } elseif ($running) {
         Write-Host 'overlay: ON' -ForegroundColor Green
     } else {
@@ -220,8 +274,18 @@ STRENGTH
 
 OPTIONS
   -s, -Strength <n|level>   strength, as above
-  -Tint <hex>               tint colour, default FF9329 (candle amber).
-                            FF6A00 is a deeper orange, FFB870 a subtler one.
+  -Engine matrix|overlay    how the tint is applied (default: matrix)
+  -Tint <hex>               overlay engine only: tint colour, default FF9329.
+
+ENGINES
+  matrix    Shifts the display white point across the whole desktop, the way
+            iOS Night Shift and Windows Night light do. Per-channel multiply,
+            so black stays black and dark themes look right. Warmth is a real
+            colour temperature: strength 100 = 2700K, strength 0 = 6500K.
+  overlay   Paints a translucent amber window on top. Because it composites
+            source-over rather than multiplying, it lifts blacks - a dark
+            desktop turns muddy orange. Kept as a fallback for machines where
+            the magnification API is unavailable.
 
 EXAMPLES
   overlay night
@@ -241,6 +305,69 @@ NOTES
     Write-Host $text
 }
 
+# --------------------------------------------------- matrix engine (win32) ---
+
+# MagSetFullscreenColorEffect applies a 5x5 colour matrix to the entire
+# desktop. A diagonal matrix is a per-channel gain, i.e. exactly the white
+# point transform Night Shift does - and being a multiply, 0 stays 0.
+$TintSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ScreenTint
+{
+    [DllImport("Magnification.dll")] static extern bool MagInitialize();
+    [DllImport("Magnification.dll")] static extern bool MagUninitialize();
+    [DllImport("Magnification.dll")] static extern bool MagSetFullscreenColorEffect(float[] pEffect);
+
+    static float[] Diagonal(float r, float g, float b)
+    {
+        return new float[25] {
+            r, 0, 0, 0, 0,
+            0, g, 0, 0, 0,
+            0, 0, b, 0, 0,
+            0, 0, 0, 1, 0,
+            0, 0, 0, 0, 1
+        };
+    }
+
+    public static bool Init()     { return MagInitialize(); }
+    public static bool Shutdown() { return MagUninitialize(); }
+
+    public static bool Apply(float r, float g, float b)
+    {
+        return MagSetFullscreenColorEffect(Diagonal(r, g, b));
+    }
+
+    // Identity - puts the screen back exactly as it was.
+    public static bool Reset()
+    {
+        return MagSetFullscreenColorEffect(Diagonal(1, 1, 1));
+    }
+}
+'@
+
+function Use-ScreenTint {
+    if (-not ('ScreenTint' -as [type])) {
+        Add-Type -TypeDefinition $script:TintSource
+    }
+}
+
+# Safety valve: if a worker ever dies without cleaning up, the desktop would
+# stay tinted with nothing left running to undo it. Any 'off' therefore resets
+# the matrix directly, whether or not a worker was found.
+function Reset-ScreenTint {
+    try {
+        Use-ScreenTint
+        if ([ScreenTint]::Init()) {
+            [void][ScreenTint]::Reset()
+            [void][ScreenTint]::Shutdown()
+        }
+    } catch {
+        # Magnification.dll missing or refusing - nothing to undo then.
+    }
+}
+
 # ----------------------------------------------------------- worker branch ---
 
 if ($Worker) {
@@ -252,6 +379,45 @@ if ($Worker) {
         $stopEvent = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $StopName)
         [void]$stopEvent.Reset()
 
+        # --- matrix engine: white point transform, no window involved --------
+        if ($Engine -eq 'matrix') {
+            $applied = $false
+            try {
+                Use-ScreenTint
+                if ([ScreenTint]::Init()) {
+                    $gains = Get-TintGains ([double]$Dim) ([double]$Warm)
+                    if ([ScreenTint]::Apply($gains.R, $gains.G, $gains.B)) {
+                        $applied = $true
+                        # Re-assert periodically: a resolution change, another
+                        # magnifier client or a session switch can drop it.
+                        while (-not $stopEvent.WaitOne(2000)) {
+                            [void][ScreenTint]::Apply($gains.R, $gains.G, $gains.B)
+                        }
+                        [void][ScreenTint]::Reset()
+                    }
+                    [void][ScreenTint]::Shutdown()
+                }
+            } catch {
+                $applied = $false
+            }
+
+            if ($applied) {
+                [void]$stopEvent.Reset()
+                $stopEvent.Dispose()
+                $mutex.ReleaseMutex()
+                $mutex.Dispose()
+                exit 0
+            }
+
+            # Magnification API unavailable (very old Windows, no WDDM driver,
+            # another client holding it). Fall through to the overlay engine so
+            # the command still does something.
+            if (-not (Test-Path $StateDir)) { [void](New-Item -ItemType Directory -Path $StateDir -Force) }
+            $stamp = '[{0}] matrix engine unavailable, fell back to overlay' -f (Get-Date -Format s)
+            Add-Content -Path $LogFile -Value $stamp -Encoding UTF8
+        }
+
+        # --- overlay engine: translucent layered window ----------------------
         $rgb = ConvertFrom-HexColour $Tint
         $layer = Get-BlendedLayer ([double]$Dim) ([double]$Warm) $rgb
         if ($null -eq $layer) { exit 0 }
@@ -393,8 +559,10 @@ if ($requested -eq 'help')   { Show-Help;   exit 0 }
 if ($requested -eq 'status') { Show-Status; exit 0 }
 
 if ($requested -eq 'off') {
-    if (Stop-Overlay) { Write-Host 'overlay: off' -ForegroundColor DarkGray }
-    else              { Write-Host 'overlay: already off' -ForegroundColor DarkGray }
+    $wasRunning = Stop-Overlay
+    Reset-ScreenTint
+    if ($wasRunning) { Write-Host 'overlay: off' -ForegroundColor DarkGray }
+    else             { Write-Host 'overlay: already off' -ForegroundColor DarkGray }
     if (Test-Path $StateFile) { Remove-Item $StateFile -Force }
     exit 0
 }
@@ -415,6 +583,7 @@ if ($requested -eq 'more' -or $requested -eq 'less') {
         $baseMode = $state.Mode
         $baseStrength = [int]$state.Strength
         $Tint = $state.Tint
+        if ($state.PSObject.Properties['Engine']) { $Engine = $state.Engine }
     }
     # "overlay more 25" steps by 25 instead of the default 10.
     $step = Resolve-Strength $Strength 10
@@ -459,6 +628,7 @@ if ($requested -eq 'custom') {
     }
     if ($strengthNum -le 0) {
         [void](Stop-Overlay)
+        Reset-ScreenTint
         if (Test-Path $StateFile) { Remove-Item $StateFile -Force }
         Write-Host 'overlay: off' -ForegroundColor DarkGray
         exit 0
@@ -483,8 +653,9 @@ if ($null -eq $layer) {
     exit 0
 }
 
+# No need to reset the matrix first - applying a new one overwrites it.
 [void](Stop-Overlay)
-Start-OverlayWorker $dimPct $warmPct ($Tint.TrimStart('#').ToUpperInvariant())
+Start-OverlayWorker $dimPct $warmPct ($Tint.TrimStart('#').ToUpperInvariant()) $Engine
 
 $deadline = [DateTime]::UtcNow.AddSeconds(15)
 while (-not (Test-OverlayRunning) -and [DateTime]::UtcNow -lt $deadline) {
@@ -498,10 +669,18 @@ if (Test-OverlayRunning) {
         Dim      = [int][Math]::Round($dimPct)
         Warm     = [int][Math]::Round($warmPct)
         Tint     = $Tint.TrimStart('#').ToUpperInvariant()
+        Engine   = $Engine
         Opacity  = $layer.Opacity
         Started  = (Get-Date).ToString('s')
     })
-    Write-Host ('overlay: {0} @ {1}  (dim {2}%, warm {3}%)' -f $requested, $strengthNum, [int]$dimPct, [int]$warmPct) -ForegroundColor Green
+    if ($Engine -eq 'matrix') {
+        $gains = Get-TintGains $dimPct $warmPct
+        Write-Host ('overlay: {0} @ {1}  ({2}K, brightness {3}%)' -f `
+            $requested, $strengthNum, $gains.Kelvin, [int](100 - $dimPct)) -ForegroundColor Green
+    } else {
+        Write-Host ('overlay: {0} @ {1}  (dim {2}%, warm {3}%)' -f `
+            $requested, $strengthNum, [int]$dimPct, [int]$warmPct) -ForegroundColor Green
+    }
 } else {
     Write-Host "overlay failed to start. See $LogFile" -ForegroundColor Red
     exit 1

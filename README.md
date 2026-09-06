@@ -6,9 +6,9 @@ A Night Shift style screen filter for Windows, driven from the command line.
 overlay night
 ```
 
-It paints a click-through, always-on-top layered window across every monitor.
-Everything underneath gets darker and/or warmer. Nothing is installed, no
-driver or gamma ramp is touched, and no registry key is written.
+It shifts the display white point across the whole desktop, the way iOS Night
+Shift and Windows Night light do. Nothing is installed, no driver or gamma ramp
+is touched, and no registry key is written.
 
 ## Install
 
@@ -39,7 +39,7 @@ Run box; `overlay.ps1` can be called directly too.
 | `overlay dark [strength]` | dimming only, no colour shift (`dim` is a synonym) |
 | `overlay sunset [strength]` | stronger dim + full warmth |
 | `overlay sleep [strength]` | heaviest dim + full warmth |
-| `overlay custom -Dim N -Warm N` | exact control, each 0-92 |
+| `overlay custom -Dim N -Warm N` | exact control: dim 0-85, warm 0-100 |
 | `overlay more` / `overlay less` | nudge the current strength by 10 |
 | `overlay off` | remove the overlay |
 | `overlay` / `overlay status` | show what is currently applied |
@@ -70,11 +70,16 @@ A bare strength implies the `night` preset, so `overlay medium` and
 Re-running any command replaces the current overlay, so `overlay sunset 80`
 while `night` is active just swaps it — no `off` needed in between.
 
-```bash
-overlay warm 35 -Tint FF6A00
-```
+### Engines
 
-`-Tint` takes any 6-digit hex colour; the default is `FF9329` (candle amber).
+`-Engine matrix` (default) shifts the display white point — the Night Shift
+approach, described below. `-Engine overlay` uses the older translucent-window
+approach, which lifts blacks; it exists as a fallback and for the `-Tint`
+option, which only applies there:
+
+```bash
+overlay warm 35 -Engine overlay -Tint FF6A00
+```
 
 ## Claude skill
 
@@ -88,38 +93,78 @@ robocopy skill "%USERPROFILE%\.claude\skills\screen-overlay" SKILL.md
 
 ## How it works
 
-`Dim` and `Warm` are two conceptual layers — black at `d`, amber at `w` — that
-get collapsed into the single colour + alpha one layered window can express:
+Night Shift is not an overlay. It adjusts the display's **white point** — a
+per-channel gain applied in the display pipeline, shifting the correlated colour
+temperature from roughly 6500K down to about 2700K at its warmest. The key
+property is that it *multiplies*: a black pixel times any gain is still black,
+so only the lit parts of the screen warm up.
+
+`overlay` does the same thing through the Win32 Magnification API.
+`MagSetFullscreenColorEffect` applies a 5x5 colour matrix to the entire desktop;
+a diagonal matrix is exactly a per-channel gain:
+
+```
+[ r 0 0 0 0 ]      r,g,b  = white point for the target temperature,
+[ 0 g 0 0 0 ]               normalised so 6500K is exactly 1,1,1
+[ 0 0 b 0 0 ]               then scaled by (1 - dim)
+[ 0 0 0 1 0 ]
+[ 0 0 0 0 1 ]
+```
+
+Temperature comes from Tanner Helland's blackbody approximation, normalised
+against the neutral white point so `warm 0` is a true identity — no cast on an
+untinted screen. `dim` is a straight multiply on all three channels, so it is
+real dimming rather than a grey veil over the top.
+
+Strength maps linearly onto temperature: `0` = 6500K, `100` = 2700K.
+
+### The overlay engine (`-Engine overlay`)
+
+The original approach, kept as a fallback: a click-through, always-on-top
+layered window carrying `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
+WS_EX_NOACTIVATE`. `dim` and `warm` collapse into the single colour + alpha one
+layered window can express:
 
 ```
 alpha  = 1 - (1 - w)(1 - d)
 colour = amber * (1 - d) * w / alpha
 ```
 
-The window carries `WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
-WS_EX_NOACTIVATE`, so clicks pass straight through, it never takes focus and it
-stays out of Alt+Tab. A 1 s timer re-asserts topmost (other windows can steal
-the top of the z-order) and re-fits the bounds when a monitor or resolution
-changes. The process is per-monitor DPI aware so it lands on real pixels across
-mixed-scaling setups.
+It composites **source-over, not multiply**, so amber over a black screen makes
+it glow faintly amber. That is why a dark desktop looks muddy under it, and why
+it is no longer the default. The worker falls back to it automatically if the
+magnification API is unavailable.
 
-A single background `powershell.exe` holds the overlay. Instance tracking and
-shutdown use a named mutex and a named event, so `overlay off` from any
-terminal closes it cleanly. State lives in
-`%LOCALAPPDATA%\ScreenOverlay\state.json`; worker crashes land in `error.log`
+A single background `powershell.exe` holds whichever engine is active. Instance
+tracking and shutdown use a named mutex and a named event, so `overlay off` from
+any terminal closes it cleanly. `off` also resets the colour matrix directly,
+so a crashed worker can never leave the screen stuck tinted. State lives in
+`%LOCALAPPDATA%\ScreenOverlay\state.json`; worker errors land in `error.log`
 next to it.
 
 ## Limits worth knowing
 
-- **Warmth lifts blacks.** A layered window composites source-over, not
-  multiply, so an amber layer over a black screen makes it glow faintly amber
-  rather than staying black. `dim` is unaffected. On dark themes, prefer a
-  lower `warm` value, or a darker `-Tint` such as `8B4A00`, which warms whites
-  while lifting blacks less. Windows' own Night light applies a colour
-  transform in the display pipeline and does not have this problem — the two
-  compose fine if you want Night light for colour and this for dimming.
-- **Exclusive-fullscreen games and the secure desktop** (UAC prompts,
-  Ctrl+Alt+Del, the lock screen) render outside the desktop compositor, so the
-  overlay does not cover them.
-- The overlay does not survive a reboot. For that, add
-  `overlay.cmd night` to `shell:startup`.
+- **Windows' own Color filters and Magnifier use the same slot.** The fullscreen
+  colour effect is one system-wide matrix, so turning on Settings →
+  Accessibility → Colour filters, or running Magnifier, will override the tint
+  (and vice versa). Windows Night light is a separate mechanism and composes
+  fine on top.
+- **Exclusive-fullscreen games** may bypass the effect, and the secure desktop
+  (UAC prompts, Ctrl+Alt+Del, lock screen) is never affected.
+- **HDR displays** apply colour transforms differently; results vary.
+- Requires Windows 8+ and a WDDM display driver — i.e. anything modern. Older
+  or unusual setups fall back to the overlay engine automatically.
+- The tint does not survive a reboot. For that, put a shortcut to
+  `overlay.cmd night` in `shell:startup`.
+- Takes ~3 s from command to visible change, which is two PowerShell cold
+  starts, not the tinting itself.
+
+## Why not gamma ramps?
+
+`SetDeviceGammaRamp` is the other classic approach (f.lux, Redshift). Windows
+rejects ramps that deviate too far from linear unless
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM\GdiIcmGammaRange` is
+set to 256 — a machine-wide registry write needing admin, which f.lux does at
+install time. It also stops working when HDR is enabled. The magnification
+matrix gets the same multiply semantics with no registry change and no
+elevation, so that is what this uses.

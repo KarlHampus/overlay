@@ -11,8 +11,9 @@ description: >
 
 # Screen overlay
 
-`overlay` paints a click-through, always-on-top tinted window across every
-monitor. It is installed at `C:\programming\claude\overlay\overlay.cmd`.
+`overlay` shifts the display white point across the whole desktop, the way iOS
+Night Shift does — a per-channel multiply, so blacks stay black and dark themes
+look right. It is installed at `C:\programming\claude\overlay\overlay.cmd`.
 
 Run it with the PowerShell tool. If the folder is on PATH, plain `overlay ...`
 works; otherwise call the full path.
@@ -54,7 +55,12 @@ overlay off                # remove it
 overlay status             # what is currently applied
 ```
 
-`-Tint <hex>` changes the tint colour (default `FF9329`, candle amber).
+Warmth is a real colour temperature: strength `0` = 6500K (neutral), `100` =
+2700K (iOS's warmest). `dark` is a pure neutral multiply with no colour shift.
+
+`-Engine overlay` switches to the legacy translucent-window approach, which
+lifts blacks. Only use it if the default visibly fails. `-Tint <hex>` applies
+to that engine only.
 
 ## Choosing for the user
 
@@ -69,11 +75,12 @@ and warm percentages.
 
 ## Limits to mention if relevant
 
-- Warm tint lifts blacks: a layered window composites source-over, not
-  multiply, so amber over a black screen makes it glow faintly. `dark` has no
-  such effect. On dark themes prefer a lower warm value or a darker
-  `-Tint` such as `8B4A00`.
-- It cannot cover exclusive-fullscreen games or the secure desktop (UAC
-  prompts, Ctrl+Alt+Del, lock screen).
-- It does not survive a reboot; a shortcut in `shell:startup` fixes that.
+- Windows' Colour filters (Settings → Accessibility) and Magnifier use the same
+  system-wide colour-effect slot and will override the tint, and vice versa.
+  Windows Night light is separate and composes fine on top.
+- Exclusive-fullscreen games may bypass it; the secure desktop (UAC prompts,
+  Ctrl+Alt+Del, lock screen) is never affected.
+- Does not survive a reboot; a shortcut in `shell:startup` fixes that.
 - Takes ~3 s from command to visible change (two PowerShell cold starts).
+- If the screen is ever left tinted unexpectedly, `overlay off` resets the
+  colour matrix directly and always recovers it.
