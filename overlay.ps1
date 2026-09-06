@@ -674,9 +674,12 @@ if (Test-OverlayRunning) {
         Started  = (Get-Date).ToString('s')
     })
     if ($Engine -eq 'matrix') {
-        $gains = Get-TintGains $dimPct $warmPct
+        # Report what the worker actually applies: it is handed rounded ints.
+        $dimApplied  = [int][Math]::Round($dimPct)
+        $warmApplied = [int][Math]::Round($warmPct)
+        $gains = Get-TintGains $dimApplied $warmApplied
         Write-Host ('overlay: {0} @ {1}  ({2}K, brightness {3}%)' -f `
-            $requested, $strengthNum, $gains.Kelvin, [int](100 - $dimPct)) -ForegroundColor Green
+            $requested, $strengthNum, $gains.Kelvin, [int](100 - $dimApplied)) -ForegroundColor Green
     } else {
         Write-Host ('overlay: {0} @ {1}  (dim {2}%, warm {3}%)' -f `
             $requested, $strengthNum, [int]$dimPct, [int]$warmPct) -ForegroundColor Green
